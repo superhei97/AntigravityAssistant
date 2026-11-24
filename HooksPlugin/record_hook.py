@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Official Antigravity Lifecycle Hook handler that updates live session state."""
+"""Official Antigravity Lifecycle Hook handler that updates live session state (macOS & Windows)."""
 import json
 import os
 import sys
@@ -17,8 +17,8 @@ def main() -> None:
     tool_name = tool_call.get("name")
     args = tool_call.get("args") or {}
     detail = args.get("toolSummary") or args.get("Path") or args.get("query")
-    if isinstance(detail, str) and "/" in detail and not args.get("toolSummary"):
-        detail = os.path.basename(detail)
+    if isinstance(detail, str) and ("/" in detail or "\\" in detail) and not args.get("toolSummary"):
+        detail = os.path.basename(detail.replace("\\", "/"))
 
     state = {
         "event": event,
@@ -32,13 +32,29 @@ def main() -> None:
         "error": payload.get("error"),
     }
 
-    out_dir = os.path.expanduser("~/Library/Application Support/AgyAssistant")
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        out_dir = os.path.join(local_app_data, "AgyAssistant")
+    else:
+        out_dir = os.path.expanduser("~/Library/Application Support/AgyAssistant")
+
     os.makedirs(out_dir, exist_ok=True)
-    tmp_path = os.path.join(out_dir, "hook_state.json.tmp")
+    tmp_path = os.path.join(out_dir, f"hook_state.{os.getpid()}.tmp")
     final_path = os.path.join(out_dir, "hook_state.json")
     with open(tmp_path, "w", encoding="utf-8") as fp:
         json.dump(state, fp, ensure_ascii=False)
-    os.replace(tmp_path, final_path)
+    for attempt in range(4):
+        try:
+            os.replace(tmp_path, final_path)
+            break
+        except OSError:
+            if attempt == 3:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            else:
+                time.sleep(0.015)
 
     if event == "PreToolUse":
         print(json.dumps({"decision": "allow"}))

@@ -4,6 +4,19 @@
 .LSOverride
 ._*
 
+# Windows & .NET / Visual Studio
+Thumbs.db
+Desktop.ini
+.vs/
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.ico
+*.user
+*.suo
+
 # Build & Packaging Outputs
 .build/
 dist/

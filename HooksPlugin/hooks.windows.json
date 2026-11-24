@@ -1,0 +1,29 @@
+{
+  "agy-floating-assistant": {
+    "SessionStart": [
+      { "type": "command", "command": "python ./record_hook.py SessionStart", "timeout": 3 }
+    ],
+    "PreInvocation": [
+      { "type": "command", "command": "python ./record_hook.py PreInvocation", "timeout": 3 }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python ./record_hook.py PreToolUse", "timeout": 3 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python ./record_hook.py PostToolUse", "timeout": 3 }
+        ]
+      }
+    ],
+    "Stop": [
+      { "type": "command", "command": "python ./record_hook.py Stop", "timeout": 3 }
+    ]
+  }
+}
