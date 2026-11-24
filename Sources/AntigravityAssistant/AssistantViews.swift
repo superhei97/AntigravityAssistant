@@ -774,7 +774,7 @@ struct ExpandedAssistantHUD: View {
                 }
 
                 if let readAt = acct.readAt {
-                    Text("实时同步自 Magpie · 读取于 \(TimeFormatters.formatUTC8(readAt, includeSeconds: true))")
+                    Text("实时同步自本地 Antigravity · 读取于 \(TimeFormatters.formatUTC8(readAt, includeSeconds: true))")
                         .font(.system(size: 9))
                         .foregroundColor(LightPalette.inkMuted)
                 }

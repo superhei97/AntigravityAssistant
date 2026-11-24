@@ -110,38 +110,52 @@ enum ConversationNavigator {
 
         let pid = runningApp.processIdentifier
         let axApp = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.8)
         AXUIElementSetAttributeValue(axApp, "AXManualAccessibility" as CFString, kCFBooleanTrue)
 
         await ensureWindowVisibleAndRaised(axApp: axApp, runningApp: runningApp)
 
         let targetPathFragment = "/c/\(conversation.id)"
-        var webAreaReady = false
+        if isViewingTargetConversation(axApp: axApp, targetPathFragment: targetPathFragment) {
+            return .alreadyActive
+        }
 
-        // Fast Path: Check Hub WebArea + Sidebar AXLink (supports deep nested project/folder trees up to depth 55)
-        for attempt in 0..<6 {
+        // Fast Path 1: Direct Sidebar AXLink scan
+        for attempt in 0..<3 {
             let scan = findTargetConversationLink(axApp: axApp, targetPathFragment: targetPathFragment)
-            webAreaReady = webAreaReady || scan.hasWebArea
-
             if scan.isAlreadyViewingTarget {
                 return .alreadyActive
             }
-
-            if let linkElement = scan.matchingLink {
-                let pressErr = AXUIElementPerformAction(linkElement, kAXPressAction as CFString)
-                if pressErr == .success {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                    return .jumpedViaDirectLink
+            if let linkElement = scan.matchingLink,
+               await pressAndVerify(linkElement, axApp: axApp, targetPathFragment: targetPathFragment) {
+                return .jumpedViaDirectLink
+            }
+            if scan.hasWebArea && !scan.sidebarFound && attempt == 0 {
+                // Uncollapse Sidebar if hidden
+                if pressButtonInHub(axApp: axApp, matchingDescription: "Toggle Sidebar") {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    continue
                 }
             }
-
-            if webAreaReady && scan.sidebarFound && attempt >= 1 {
+            if scan.sidebarFound {
                 break
             }
-
-            try? await Task.sleep(nanoseconds: 75_000_000)
+            try? await Task.sleep(nanoseconds: 80_000_000)
         }
 
-        // Fallback Path: Sidebar collapsed (`⌘B`) or conversation inside collapsed folder / older history
+        // Fast Path 2: Auto-expand collapsed Project / Conversations group in Sidebar (Antigravity 2.33+)
+        if await expandSidebarSectionForProject(axApp: axApp, projectName: conversation.projectName) {
+            let postExpandScan = findTargetConversationLink(axApp: axApp, targetPathFragment: targetPathFragment)
+            if postExpandScan.isAlreadyViewingTarget {
+                return .alreadyActive
+            }
+            if let linkElement = postExpandScan.matchingLink,
+               await pressAndVerify(linkElement, axApp: axApp, targetPathFragment: targetPathFragment) {
+                return .jumpedViaDirectLink
+            }
+        }
+
+        // Fallback Path: Older conversation in deep history via `Cmd + K` FastPick
         let pickerSuccess = await navigateViaConversationPicker(
             axApp: axApp,
             runningApp: runningApp,
@@ -371,10 +385,11 @@ enum ConversationNavigator {
     @discardableResult
     static func activateOrLaunchAntigravity() async -> NSRunningApplication? {
         if let existing = NSRunningApplication.runningApplications(withBundleIdentifier: antigravityBundleId).first {
-            existing.activate(options: [.activateAllWindows])
-            return existing
+            NSApp?.yieldActivation(to: existing)
         }
 
+        // On macOS 14+, NSRunningApplication.activate() from a non-active accessory panel is ignored.
+        // NSWorkspace.openApplication reliably brings Antigravity to the foreground across spaces/apps.
         let appURL = URL(fileURLWithPath: antigravityAppPath)
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
@@ -385,16 +400,16 @@ enum ConversationNavigator {
             }
         }
 
-        for _ in 0..<20 {
+        for _ in 0..<18 {
             if let app = launched ?? NSRunningApplication.runningApplications(withBundleIdentifier: antigravityBundleId).first,
                app.isFinishedLaunching {
-                app.activate(options: [.activateAllWindows])
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                return app
+                if app.isActive {
+                    return app
+                }
             }
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            try? await Task.sleep(nanoseconds: 45_000_000)
         }
-        return NSRunningApplication.runningApplications(withBundleIdentifier: antigravityBundleId).first
+        return launched ?? NSRunningApplication.runningApplications(withBundleIdentifier: antigravityBundleId).first
     }
 
     @MainActor
@@ -404,7 +419,7 @@ enum ConversationNavigator {
         if windows.isEmpty {
             if let url = URL(string: "antigravity://focus") {
                 NSWorkspace.shared.open(url)
-                try? await Task.sleep(nanoseconds: 360_000_000)
+                try? await Task.sleep(nanoseconds: 320_000_000)
             }
         } else {
             for win in windows {
@@ -419,7 +434,6 @@ enum ConversationNavigator {
             }
         }
 
-        runningApp.activate(options: [.activateAllWindows])
         AXUIElementSetAttributeValue(axApp, "AXManualAccessibility" as CFString, kCFBooleanTrue)
     }
 
@@ -431,7 +445,7 @@ enum ConversationNavigator {
         if role == "AXMenuBar" { return nil }
         if role == "AXWebArea" {
             let url = copyURLStringAttribute(element) ?? ""
-            if !url.hasPrefix("data:") && !url.isEmpty {
+            if url.contains("127.0.0.1:") || url.contains("localhost:") {
                 return element
             }
             return nil
@@ -565,6 +579,25 @@ enum ConversationNavigator {
         var matchingLink: AXUIElement? = nil
     }
 
+    private static func isViewingTargetConversation(axApp: AXUIElement, targetPathFragment: String) -> Bool {
+        guard let windows = copyElementArrayAttribute(axApp, kAXWindowsAttribute as CFString) else {
+            return false
+        }
+        for win in windows {
+            if let hubWebArea = findHubWebArea(in: win, depth: 0),
+               let webURL = copyURLStringAttribute(hubWebArea),
+               webURL.contains(targetPathFragment) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func isConvoPickerPlaceholder(_ placeholder: String) -> Bool {
+        placeholder.localizedCaseInsensitiveContains("Search for conversations")
+            || placeholder.localizedCaseInsensitiveContains("Search conversations")
+    }
+
     private static func findTargetConversationLink(axApp: AXUIElement, targetPathFragment: String) -> TargetLinkScan {
         var out = TargetLinkScan()
         guard let windows = copyElementArrayAttribute(axApp, kAXWindowsAttribute as CFString) else {
@@ -580,29 +613,29 @@ enum ConversationNavigator {
                 return out
             }
 
-            // Priority 1: Scan Sidebar first (fast, ~60 nodes, hits depth 25+ directly)
+            // Priority 1: Scan Sidebar first (fast, ~400 nodes max)
             if let sidebar = findSidebar(in: hubWebArea, depth: 0) {
                 out.sidebarFound = true
-                if let link = findLinkInSubtree(sidebar, targetPathFragment: targetPathFragment, maxDepth: 32) {
+                if let link = findLinkInSubtree(sidebar, targetPathFragment: targetPathFragment, maxDepth: 28) {
                     out.matchingLink = link
                     return out
                 }
             }
 
-            // Priority 2: Scan remaining top-level Hub controls (e.g. open tabs, picker modal)
+            // Priority 2: Scan top-level Hub controls (open tabs, picker input) with tight depth cap
             var queue: [(AXUIElement, Int)] = [(hubWebArea, 0)]
             var head = 0
-            while head < queue.count && head < 2500 {
+            while head < queue.count && head < 600 {
                 let (cur, d) = queue[head]
                 head += 1
 
                 let role = copyStringAttribute(cur, kAXRoleAttribute as CFString) ?? ""
                 let desc = copyStringAttribute(cur, kAXDescriptionAttribute as CFString) ?? ""
-                if desc == "Sidebar" { continue } // Already scanned thoroughly above
+                if desc == "Sidebar" || role == "AXHeading" { continue }
 
                 if role == (kAXTextFieldRole as String) {
                     if let ph = copyStringAttribute(cur, kAXPlaceholderValueAttribute as CFString),
-                       ph.localizedCaseInsensitiveContains("Search for conversations") {
+                       isConvoPickerPlaceholder(ph) {
                         out.isConvoPickerOpen = true
                     }
                 } else if role == "AXLink" {
@@ -612,7 +645,7 @@ enum ConversationNavigator {
                     }
                 }
 
-                if d < 28, let cs = copyElementArrayAttribute(cur, kAXChildrenAttribute as CFString) {
+                if d < 16, let cs = copyElementArrayAttribute(cur, kAXChildrenAttribute as CFString) {
                     for c in cs { queue.append((c, d + 1)) }
                 }
             }
@@ -643,6 +676,128 @@ enum ConversationNavigator {
         return nil
     }
 
+    private static func pressButtonInHub(axApp: AXUIElement, matchingDescription: String) -> Bool {
+        guard let windows = copyElementArrayAttribute(axApp, kAXWindowsAttribute as CFString) else {
+            return false
+        }
+        for win in windows {
+            guard let hubWebArea = findHubWebArea(in: win, depth: 0) else { continue }
+            if let btn = findElementInSubtree(
+                hubWebArea,
+                role: "AXButton",
+                matchingDescriptions: [matchingDescription],
+                maxDepth: 20
+            ) {
+                return AXUIElementPerformAction(btn, kAXPressAction as CFString) == .success
+            }
+        }
+        return false
+    }
+
+    private static func isElementExpanded(_ element: AXUIElement) -> Bool? {
+        var val: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXExpandedAttribute as CFString, &val) == .success,
+              let b = val as? Bool else {
+            return nil
+        }
+        return b
+    }
+
+    private static func findSidebarButtons(in sidebar: AXUIElement) -> [(element: AXUIElement, title: String)] {
+        var results: [(AXUIElement, String)] = []
+        func walk(_ el: AXUIElement, _ d: Int) {
+            guard d <= 12 else { return }
+            if copyStringAttribute(el, kAXRoleAttribute as CFString) == "AXButton" {
+                let t = copyStringAttribute(el, kAXTitleAttribute as CFString) ?? ""
+                if !t.isEmpty {
+                    results.append((el, t))
+                }
+            }
+            for c in copyElementArrayAttribute(el, kAXChildrenAttribute as CFString) ?? [] {
+                walk(c, d + 1)
+            }
+        }
+        walk(sidebar, 0)
+        return results
+    }
+
+    @MainActor
+    private static func expandSidebarSectionForProject(axApp: AXUIElement, projectName: String) async -> Bool {
+        guard let windows = copyElementArrayAttribute(axApp, kAXWindowsAttribute as CFString) else {
+            return false
+        }
+        for win in windows {
+            guard let hubWebArea = findHubWebArea(in: win, depth: 0),
+                  let sidebar = findSidebar(in: hubWebArea, depth: 0) else { continue }
+
+            var didExpandAny = false
+            var buttons = findSidebarButtons(in: sidebar)
+
+            if projectName == "default" || projectName.isEmpty {
+                if let convSec = buttons.first(where: { $0.title == "Conversations" }),
+                   isElementExpanded(convSec.element) == false {
+                    _ = AXUIElementPerformAction(convSec.element, "AXScrollToVisible" as CFString)
+                    if AXUIElementPerformAction(convSec.element, kAXPressAction as CFString) == .success {
+                        didExpandAny = true
+                        try? await Task.sleep(nanoseconds: 140_000_000)
+                    }
+                }
+            } else {
+                // 1. Ensure "Projects" top group is expanded
+                if let projRoot = buttons.first(where: { $0.title == "Projects" }),
+                   isElementExpanded(projRoot.element) == false {
+                    _ = AXUIElementPerformAction(projRoot.element, "AXScrollToVisible" as CFString)
+                    if AXUIElementPerformAction(projRoot.element, kAXPressAction as CFString) == .success {
+                        didExpandAny = true
+                        try? await Task.sleep(nanoseconds: 130_000_000)
+                        buttons = findSidebarButtons(in: sidebar)
+                    }
+                }
+
+                // 2. If target project isn't visible yet and "See all (...)" exists, expand project list
+                if !buttons.contains(where: { $0.title.caseInsensitiveCompare(projectName) == .orderedSame }),
+                   let seeAll = buttons.first(where: { $0.title.lowercased().hasPrefix("see all") }) {
+                    _ = AXUIElementPerformAction(seeAll.element, "AXScrollToVisible" as CFString)
+                    if AXUIElementPerformAction(seeAll.element, kAXPressAction as CFString) == .success {
+                        didExpandAny = true
+                        try? await Task.sleep(nanoseconds: 130_000_000)
+                        buttons = findSidebarButtons(in: sidebar)
+                    }
+                }
+
+                // 3. Expand the specific project folder (e.g. "backend-service", "web-client")
+                if let projBtn = buttons.first(where: { $0.title.caseInsensitiveCompare(projectName) == .orderedSame }),
+                   isElementExpanded(projBtn.element) == false {
+                    _ = AXUIElementPerformAction(projBtn.element, "AXScrollToVisible" as CFString)
+                    if AXUIElementPerformAction(projBtn.element, kAXPressAction as CFString) == .success {
+                        didExpandAny = true
+                        try? await Task.sleep(nanoseconds: 150_000_000)
+                    }
+                }
+            }
+
+            if didExpandAny {
+                return true
+            }
+        }
+        return false
+    }
+
+    @MainActor
+    private static func pressAndVerify(
+        _ link: AXUIElement, axApp: AXUIElement, targetPathFragment: String
+    ) async -> Bool {
+        _ = AXUIElementPerformAction(link, "AXScrollToVisible" as CFString)
+        guard AXUIElementPerformAction(link, kAXPressAction as CFString) == .success else { return false }
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 65_000_000)
+            if isViewingTargetConversation(axApp: axApp, targetPathFragment: targetPathFragment) {
+                return true
+            }
+        }
+        return false
+    }
+
     // MARK: - Conversation Picker (`Cmd + K`) Fallback
 
     @MainActor
@@ -652,26 +807,19 @@ enum ConversationNavigator {
         conversation: ConversationSnapshot,
         targetPathFragment: String
     ) async -> Bool {
-        runningApp.activate(options: [.activateAllWindows])
-        try? await Task.sleep(nanoseconds: 70_000_000)
+        if !runningApp.isActive {
+            _ = await activateOrLaunchAntigravity()
+        }
 
-        let preScan = findTargetConversationLink(axApp: axApp, targetPathFragment: targetPathFragment)
-        if preScan.isAlreadyViewingTarget { return true }
-        if let link = preScan.matchingLink,
-           AXUIElementPerformAction(link, kAXPressAction as CFString) == .success {
+        if isViewingTargetConversation(axApp: axApp, targetPathFragment: targetPathFragment) {
             return true
         }
 
-        if !preScan.isConvoPickerOpen {
+        // Prefer clicking the toolbar "Search Conversations" button if present, else Cmd+K
+        if !pressButtonInHub(axApp: axApp, matchingDescription: "Search Conversations") {
             postKeyShortcut(virtualKey: CGKeyCode(kVK_ANSI_K), flags: .maskCommand)
-            try? await Task.sleep(nanoseconds: 190_000_000)
         }
-
-        let pickerScan = findTargetConversationLink(axApp: axApp, targetPathFragment: targetPathFragment)
-        if let link = pickerScan.matchingLink,
-           AXUIElementPerformAction(link, kAXPressAction as CFString) == .success {
-            return true
-        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
 
         let query = cleanPickerQuery(for: conversation)
         guard !query.isEmpty else {
@@ -679,29 +827,36 @@ enum ConversationNavigator {
             return false
         }
 
-        sendUnicodeText(query)
-        try? await Task.sleep(nanoseconds: 340_000_000)
-
-        postKeyShortcut(virtualKey: CGKeyCode(kVK_Return), flags: [])
-        try? await Task.sleep(nanoseconds: 180_000_000)
-
-        let postScan = findTargetConversationLink(axApp: axApp, targetPathFragment: targetPathFragment)
-        if postScan.isAlreadyViewingTarget {
-            return true
-        }
-        if postScan.isConvoPickerOpen {
-            postKeyShortcut(virtualKey: CGKeyCode(kVK_Escape), flags: [])
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString, &focusedValue) == .success,
+              let focusedValue, CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
             return false
         }
-        return true
+        let focused = unsafeBitCast(focusedValue, to: AXUIElement.self)
+        let ph = copyStringAttribute(focused, kAXPlaceholderValueAttribute as CFString) ?? ""
+        guard isConvoPickerPlaceholder(ph) else { return false }
+
+        postKeyShortcut(virtualKey: CGKeyCode(kVK_ANSI_A), flags: .maskCommand)
+        let fullQuery = ph.localizedCaseInsensitiveContains("commands") ? "conversations: \(query)" : query
+        sendUnicodeText(fullQuery)
+        try? await Task.sleep(nanoseconds: 240_000_000)
+
+        postKeyShortcut(virtualKey: CGKeyCode(kVK_Return), flags: [])
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 70_000_000)
+            if isViewingTargetConversation(axApp: axApp, targetPathFragment: targetPathFragment) {
+                return true
+            }
+        }
+        return false
     }
 
     private static func cleanPickerQuery(for conversation: ConversationSnapshot) -> String {
-        let raw = conversation.searchQuery.isEmpty ? conversation.title : conversation.searchQuery
+        let raw = conversation.title.isEmpty ? conversation.searchQuery : conversation.title
         let stripped = raw
             .replacingOccurrences(of: "…", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return stripped.count > 24 ? String(stripped.prefix(24)) : stripped
+        return stripped.count > 28 ? String(stripped.prefix(28)) : stripped
     }
 
     private static func extractConversationId(fromURL url: String) -> String? {

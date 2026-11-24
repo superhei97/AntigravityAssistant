@@ -48,10 +48,78 @@ struct CloudAccountQuota: Identifiable, Equatable {
     let errorMessage: String?
 }
 
-// MARK: - Async Magpie Client
+// MARK: - Local Antigravity LanguageServer RPC Models (`RetrieveUserQuotaSummary` & `GetUserStatus`)
+
+private struct LocalDaemonInfo: Decodable {
+    let pid: Int?
+    let httpsPort: Int?
+    let httpPort: Int?
+    let csrfToken: String
+}
+
+private struct LocalQuotaSummaryEnvelope: Decodable {
+    struct ResponseBody: Decodable {
+        let groups: [QuotaGroup]?
+    }
+    struct QuotaGroup: Decodable {
+        let displayName: String?
+        let buckets: [QuotaBucket]?
+    }
+    struct QuotaBucket: Decodable {
+        let bucketId: String?
+        let displayName: String?
+        let window: String?
+        let remainingFraction: Double?
+        let resetTime: String?
+    }
+    let response: ResponseBody?
+}
+
+private struct LocalUserStatusEnvelope: Decodable {
+    struct UserStatus: Decodable {
+        struct PlanStatus: Decodable {
+            struct PlanInfo: Decodable {
+                let planName: String?
+            }
+            let planInfo: PlanInfo?
+        }
+        struct UserTier: Decodable {
+            let name: String?
+        }
+        struct CascadeModelConfigData: Decodable {
+            struct ClientModelConfig: Decodable {
+                struct QuotaInfo: Decodable {
+                    let remainingFraction: Double?
+                    let resetTime: String?
+                }
+                let label: String?
+                let modelId: String?
+                let quotaInfo: QuotaInfo?
+            }
+            let clientModelConfigs: [ClientModelConfig]?
+        }
+        let name: String?
+        let email: String?
+        let planStatus: PlanStatus?
+        let userTier: UserTier?
+        let cascadeModelConfigData: CascadeModelConfigData?
+    }
+    let userStatus: UserStatus?
+}
+
+// MARK: - Async Quota Client (Primary: Local Antigravity LanguageServer; Fallback: Magpie)
 
 enum MagpieQuotaClient {
     static let defaultGatewayBase = "http://127.0.0.1:3425"
+
+    /// Dedicated direct localhost URLSession that bypasses system HTTP/SOCKS proxies.
+    private static let localSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 3.0
+        config.timeoutIntervalForResource = 4.0
+        config.connectionProxyDictionary = [:]
+        return URLSession(configuration: config)
+    }()
 
     private static var candidateCliPaths: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -74,8 +142,12 @@ enum MagpieQuotaClient {
         resolvedCliPath != nil
     }
 
-    /// Fast path: Query Magpie's documented local HTTP gateway (`GET /v1/magpie/quotas`), fallback to CLI `--json`.
+    /// Primary path: Query local Antigravity `language_server` (`~/.gemini/antigravity/daemon/*.json`),
+    /// fallback to Magpie HTTP/CLI only if local Antigravity daemon is not running.
     static func fetchAntigravityAccounts(gatewayBase: String = defaultGatewayBase, allowCliFallback: Bool = true) async -> [CloudAccountQuota]? {
+        if let localAccount = await fetchFromLocalAntigravity() {
+            return [localAccount]
+        }
         if let httpCards = await fetchViaHTTP(gatewayBase: gatewayBase) {
             let mapped = mapCards(httpCards)
             if !mapped.isEmpty {
@@ -90,14 +162,201 @@ enum MagpieQuotaClient {
         return nil
     }
 
-    /// Force live upstream cloud refresh (`magpie quota refresh antigravity --json`)
+    /// Force live quota refresh directly from local Antigravity `language_server` (or Magpie fallback).
     static func forceRefreshFromCloud() async -> [CloudAccountQuota]? {
+        if let localAccount = await fetchFromLocalAntigravity() {
+            return [localAccount]
+        }
         guard isMagpieInstalled() else { return nil }
         if let cliCards = await runMagpieCLI(arguments: ["quota", "refresh", "antigravity", "--json"]) {
             let mapped = mapCards(cliCards)
             return mapped.isEmpty ? nil : mapped
         }
         return nil
+    }
+
+    // MARK: - Local Antigravity LanguageServer Direct RPC
+
+    private static func discoverLocalDaemons() -> [LocalDaemonInfo] {
+        let daemonDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/antigravity/daemon", isDirectory: true)
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: daemonDir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let sorted = urls
+            .filter { $0.pathExtension == "json" }
+            .sorted { a, b in
+                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return da > db
+            }
+
+        var results: [LocalDaemonInfo] = []
+        for url in sorted {
+            if let data = try? Data(contentsOf: url),
+               let info = try? JSONDecoder().decode(LocalDaemonInfo.self, from: data),
+               !info.csrfToken.isEmpty,
+               info.httpPort != nil {
+                results.append(info)
+            }
+        }
+        return results
+    }
+
+    private static func fetchFromLocalAntigravity() async -> CloudAccountQuota? {
+        let daemons = discoverLocalDaemons()
+        for daemon in daemons {
+            guard let port = daemon.httpPort else { continue }
+            async let summaryTask: LocalQuotaSummaryEnvelope? = callLocalLanguageServer(
+                port: port,
+                csrfToken: daemon.csrfToken,
+                method: "RetrieveUserQuotaSummary"
+            )
+            async let statusTask: LocalUserStatusEnvelope? = callLocalLanguageServer(
+                port: port,
+                csrfToken: daemon.csrfToken,
+                method: "GetUserStatus"
+            )
+
+            let (summaryEnv, statusEnv) = await (summaryTask, statusTask)
+            if summaryEnv == nil && statusEnv == nil {
+                continue
+            }
+
+            let userStatus = statusEnv?.userStatus
+            let email = userStatus?.email ?? userStatus?.name ?? "Antigravity 本地账号"
+            let plan = userStatus?.userTier?.name
+                ?? userStatus?.planStatus?.planInfo?.planName
+                ?? "Antigravity"
+
+            var geminiPool: CloudPoolQuota? = nil
+            var claudePool: CloudPoolQuota? = nil
+
+            if let groups = summaryEnv?.response?.groups {
+                for group in groups {
+                    let gName = (group.displayName ?? "").lowercased()
+                    let buckets = group.buckets ?? []
+                    if gName.contains("gemini") || buckets.contains(where: { ($0.bucketId ?? "").hasPrefix("gemini") }) {
+                        geminiPool = buildPoolFromLocalBuckets(poolLabel: "Gemini", buckets: buckets)
+                    } else if gName.contains("claude") || gName.contains("gpt") || buckets.contains(where: { ($0.bucketId ?? "").hasPrefix("3p") }) {
+                        claudePool = buildPoolFromLocalBuckets(poolLabel: "Claude & GPT", buckets: buckets)
+                    }
+                }
+            }
+
+            // Fallback to clientModelConfigs if RetrieveUserQuotaSummary buckets were absent
+            if geminiPool == nil || claudePool == nil,
+               let configs = userStatus?.cascadeModelConfigData?.clientModelConfigs {
+                if geminiPool == nil {
+                    geminiPool = buildPoolFromModelConfigs(
+                        poolLabel: "Gemini",
+                        configs: configs.filter {
+                            let label = ($0.label ?? "").lowercased()
+                            return label.contains("gemini") || label.contains("orchestrator")
+                        }
+                    )
+                }
+                if claudePool == nil {
+                    claudePool = buildPoolFromModelConfigs(
+                        poolLabel: "Claude & GPT",
+                        configs: configs.filter {
+                            let label = ($0.label ?? "").lowercased()
+                            return label.contains("claude") || label.contains("gpt")
+                        }
+                    )
+                }
+            }
+
+            guard geminiPool != nil || claudePool != nil else { continue }
+
+            return CloudAccountQuota(
+                userEmail: email,
+                planName: plan,
+                geminiPool: geminiPool,
+                claudeGptPool: claudePool,
+                readAt: Date(),
+                isLatestActive: true,
+                errorMessage: nil
+            )
+        }
+        return nil
+    }
+
+    private static func callLocalLanguageServer<T: Decodable>(
+        port: Int,
+        csrfToken: String,
+        method: String
+    ) async -> T? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/\(method)") else {
+            return nil
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        req.setValue(csrfToken, forHTTPHeaderField: "x-codeium-csrf-token")
+        req.httpBody = Data(#"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","locale":"zh"}}"#.utf8)
+
+        do {
+            let (data, resp) = try await localSession.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                return nil
+            }
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func buildPoolFromLocalBuckets(
+        poolLabel: String,
+        buckets: [LocalQuotaSummaryEnvelope.QuotaBucket]
+    ) -> CloudPoolQuota? {
+        guard !buckets.isEmpty else { return nil }
+        let b5h = buckets.first {
+            let w = ($0.window ?? "").lowercased()
+            let id = ($0.bucketId ?? "").lowercased()
+            return w == "5h" || id.hasSuffix("-5h")
+        }
+        let b7d = buckets.first {
+            let w = ($0.window ?? "").lowercased()
+            let id = ($0.bucketId ?? "").lowercased()
+            return w == "weekly" || w == "7d" || id.hasSuffix("-weekly")
+        }
+        guard b5h != nil || b7d != nil else { return nil }
+        let rem5h = max(0.0, min(100.0, (b5h?.remainingFraction ?? 1.0) * 100.0))
+        let rem7d = max(0.0, min(100.0, (b7d?.remainingFraction ?? 1.0) * 100.0))
+        return CloudPoolQuota(
+            poolName: poolLabel,
+            remaining5h: rem5h,
+            resetsAt5h: parseAnyISODate(b5h?.resetTime),
+            remaining7d: rem7d,
+            resetsAt7d: parseAnyISODate(b7d?.resetTime)
+        )
+    }
+
+    private static func buildPoolFromModelConfigs(
+        poolLabel: String,
+        configs: [LocalUserStatusEnvelope.UserStatus.CascadeModelConfigData.ClientModelConfig]
+    ) -> CloudPoolQuota? {
+        guard let firstWithQuota = configs.first(where: { $0.quotaInfo != nil }),
+              let q = firstWithQuota.quotaInfo else {
+            return nil
+        }
+        let pct = max(0.0, min(100.0, (q.remainingFraction ?? 1.0) * 100.0))
+        let resetDate = parseAnyISODate(q.resetTime)
+        return CloudPoolQuota(
+            poolName: poolLabel,
+            remaining5h: pct,
+            resetsAt5h: resetDate,
+            remaining7d: pct,
+            resetsAt7d: resetDate
+        )
     }
 
     private static func fetchViaHTTP(gatewayBase: String) async -> [MagpieProviderCard]? {
@@ -160,7 +419,7 @@ enum MagpieQuotaClient {
     }
 
     private static func mapCards(_ cards: [MagpieProviderCard]) -> [CloudAccountQuota] {
-        cards.map { card in
+        cards.compactMap { card in
             let wins = card.windows ?? []
 
             let geminiPool = buildPool(
@@ -178,6 +437,8 @@ enum MagpieQuotaClient {
                     $0.name.lowercased().contains("claude")
                 }
             )
+
+            guard geminiPool != nil || claudePool != nil else { return nil }
 
             return CloudAccountQuota(
                 userEmail: card.user ?? "Antigravity Account",

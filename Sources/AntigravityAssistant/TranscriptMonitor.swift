@@ -375,13 +375,13 @@ final class TranscriptMonitor: ObservableObject {
             if let refreshed = await MagpieQuotaClient.forceRefreshFromCloud() {
                 self.cloudAccounts = refreshed
                 recomputeQuota()
-                showToast("✅ 已从 Google 云端刷新真实配额")
+                showToast("✅ 已从本地 Antigravity 同步实时配额")
             } else if let fetched = await MagpieQuotaClient.fetchAntigravityAccounts(allowCliFallback: true) {
                 self.cloudAccounts = fetched
                 recomputeQuota()
-                showToast("已同步 Magpie 本地网关配额")
+                showToast("✅ 已同步实时配额")
             } else {
-                showToast("未检测到 Magpie 响应")
+                showToast("未检测到运行中的 Antigravity 本地服务")
             }
             return
         }

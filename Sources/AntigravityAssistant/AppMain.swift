@@ -294,6 +294,30 @@ struct AntigravityAssistantApp {
             return
         }
 
+        if let jumpIdx = args.firstIndex(of: "--test-jump"), jumpIdx + 1 < args.count {
+            let needle = args[jumpIdx + 1]
+            let settings = AppSettings()
+            let monitor = TranscriptMonitor(settings: settings)
+            monitor.refreshNow()
+            guard let target = monitor.conversations.first(where: {
+                $0.id.contains(needle) || $0.title.localizedCaseInsensitiveContains(needle)
+            }) else {
+                print("No matching conversation for: \(needle)")
+                exit(1)
+            }
+            let t0 = Date()
+            let sem = DispatchSemaphore(value: 0)
+            Task { @MainActor in
+                let outcome = await ConversationNavigator.jump(to: target)
+                print(String(format: "Jump to '%@' [%@] -> %@ in %.3fs", target.title, target.projectName, String(describing: outcome), Date().timeIntervalSince(t0)))
+                sem.signal()
+            }
+            while sem.wait(timeout: .now() + 0.02) == .timedOut {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            }
+            return
+        }
+
         if args.contains("--self-test") {
             let settings = AppSettings()
             let monitor = TranscriptMonitor(settings: settings)
