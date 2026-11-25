@@ -1,3 +1,5 @@
+import AppKit
+import Darwin
 import Foundation
 
 // MARK: - Magpie Public Quota API Models (`GET /v1/magpie/quotas` & `magpie quota antigravity --json`)
@@ -177,6 +179,22 @@ enum MagpieQuotaClient {
 
     // MARK: - Local Antigravity LanguageServer Direct RPC
 
+    private static func executablePath(for pid: pid_t) -> String {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let len = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard len > 0 else { return "" }
+        return String(cString: buffer)
+    }
+
+    private static func parentPid(for pid: pid_t) -> pid_t {
+        var kinfo = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        let rc = sysctl(&mib, 4, &kinfo, &size, nil, 0)
+        guard rc == 0 else { return -1 }
+        return kinfo.kp_eproc.e_ppid
+    }
+
     private static func discoverLocalDaemons() -> [LocalDaemonInfo] {
         let daemonDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".gemini/antigravity/daemon", isDirectory: true)
@@ -188,24 +206,53 @@ enum MagpieQuotaClient {
             return []
         }
 
-        let sorted = urls
-            .filter { $0.pathExtension == "json" }
-            .sorted { a, b in
-                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return da > db
+        let antigravityAppPids = Set(
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.antigravity")
+                .map(\.processIdentifier)
+        )
+
+        struct RankedDaemon {
+            let info: LocalDaemonInfo
+            let rank: Int
+            let mtime: Date
+        }
+
+        var candidates: [RankedDaemon] = []
+        for url in urls where url.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: url),
+                  let info = try? JSONDecoder().decode(LocalDaemonInfo.self, from: data),
+                  !info.csrfToken.isEmpty,
+                  info.httpPort != nil else {
+                continue
             }
 
-        var results: [LocalDaemonInfo] = []
-        for url in sorted {
-            if let data = try? Data(contentsOf: url),
-               let info = try? JSONDecoder().decode(LocalDaemonInfo.self, from: data),
-               !info.csrfToken.isEmpty,
-               info.httpPort != nil {
-                results.append(info)
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            var rank = 1
+            if let rawPid = info.pid, rawPid > 0 {
+                let cpid = pid_t(rawPid)
+                // Skip stale daemon JSON files whose process has already exited
+                if kill(cpid, 0) != 0 && errno == ESRCH {
+                    continue
+                }
+                let execPath = executablePath(for: cpid)
+                let ppid = parentPid(for: cpid)
+                if antigravityAppPids.contains(ppid) || execPath.contains("/Antigravity.app/") {
+                    // Highest priority: daemon directly owned by /Applications/Antigravity.app
+                    rank = 0
+                } else if execPath.contains("/Gemini.app/") {
+                    // Lowest priority: separate Gemini.app helper sharing ~/.gemini/antigravity/daemon
+                    rank = 2
+                }
             }
+            candidates.append(RankedDaemon(info: info, rank: rank, mtime: mtime))
         }
-        return results
+
+        candidates.sort { a, b in
+            if a.rank != b.rank { return a.rank < b.rank }
+            return a.mtime > b.mtime
+        }
+
+        return candidates.map(\.info)
     }
 
     private static func fetchFromLocalAntigravity() async -> CloudAccountQuota? {
