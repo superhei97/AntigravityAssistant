@@ -495,19 +495,40 @@ namespace AntigravityAssistant
                         }
                     }
 
-                    // 3. Expand the specific project folder
+                    // 3. Expand the specific project folder, or if not pinned under "Projects"
+                    //    (e.g. ungrouped workspace folder), also ensure "Conversations" is expanded.
                     AutomationElement projBtn = FindNamedButton(buttons, projectName, true);
-                    if (projBtn != null && GetElementExpandedState(projBtn) == false)
+                    if (projBtn != null)
                     {
-                        bool ok = await Task.Run(delegate
+                        if (GetElementExpandedState(projBtn) == false)
                         {
-                            TryScrollIntoView(projBtn);
-                            return TryInvokeOrExpandElement(projBtn);
-                        });
-                        if (ok)
+                            bool ok = await Task.Run(delegate
+                            {
+                                TryScrollIntoView(projBtn);
+                                return TryInvokeOrExpandElement(projBtn);
+                            });
+                            if (ok)
+                            {
+                                didExpandAny = true;
+                                await Task.Delay(150);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        AutomationElement convSec = FindNamedButton(buttons, "Conversations", false);
+                        if (convSec != null && GetElementExpandedState(convSec) == false)
                         {
-                            didExpandAny = true;
-                            await Task.Delay(150);
+                            bool ok = await Task.Run(delegate
+                            {
+                                TryScrollIntoView(convSec);
+                                return TryInvokeOrExpandElement(convSec);
+                            });
+                            if (ok)
+                            {
+                                didExpandAny = true;
+                                await Task.Delay(140);
+                            }
                         }
                     }
                 }
@@ -518,6 +539,29 @@ namespace AntigravityAssistant
                 }
             }
             return false;
+        }
+
+        // MARK: - Conversation Picker (`Search Conversations` / `Ctrl + K`) Fallback
+
+        private sealed class LocatedPicker
+        {
+            public AutomationElement HubDocument;
+            public AutomationElement Dialog;
+            public AutomationElement Input;
+            public string Placeholder;
+        }
+
+        private sealed class PickerRowEntry
+        {
+            public AutomationElement Element;
+            public string Text;
+            public List<string> ChildTexts;
+        }
+
+        private sealed class PickerScanResult
+        {
+            public List<PickerRowEntry> Rows = new List<PickerRowEntry>();
+            public bool HasNoResults;
         }
 
         private static async Task<bool> NavigateViaPickerAsync(IntPtr hwnd, ConversationSnapshot conv, string targetFragment)
@@ -531,68 +575,297 @@ namespace AntigravityAssistant
             bool alreadyViewing = await Task.Run(delegate { return IsViewingTargetConversation(targetFragment); });
             if (alreadyViewing) return true;
 
-            // Prefer clicking toolbar "Search Conversations" button if present, else Ctrl+K
-            bool clickedSearchBtn = await Task.Run(delegate { return PressButtonInHub("Search Conversations"); });
-            if (!clickedSearchBtn)
+            bool wasPickerAlreadyOpen = await Task.Run(delegate { return IsConversationPickerOpen(false); });
+            bool didTriggerOpen = wasPickerAlreadyOpen;
+            if (!wasPickerAlreadyOpen)
             {
-                Win32Native.ForceActivateWindow(hwnd);
-                Win32Native.SendKeyShortcut(Win32Native.VK_K, true);
+                // Prefer clicking toolbar "Search Conversations" button if present, else Ctrl+K
+                bool clickedSearchBtn = await Task.Run(delegate { return PressButtonInHub("Search Conversations"); });
+                if (clickedSearchBtn)
+                {
+                    didTriggerOpen = true;
+                }
+                else
+                {
+                    Win32Native.ForceActivateWindow(hwnd);
+                    Win32Native.SendKeyShortcut(Win32Native.VK_K, true);
+                    didTriggerOpen = true;
+                }
             }
-            await Task.Delay(200);
 
-            // Check if the target conversation link is already directly visible in the opened picker list
-            TargetLinkScan pickerScan = await Task.Run(delegate { return ScanForTargetLink(targetFragment); });
-            if (pickerScan.IsAlreadyViewingTarget) return true;
-            if (pickerScan.MatchingLink != null)
+            bool selected = await PerformPickerSelectionAsync(hwnd, conv, targetFragment);
+            bool nowViewing = await Task.Run(delegate { return IsViewingTargetConversation(targetFragment); });
+
+            if (selected && nowViewing)
             {
-                bool jumped = await InvokeAndVerifyAsync(pickerScan.MatchingLink, targetFragment);
-                if (jumped) return true;
+                bool stillOpen = await Task.Run(delegate { return IsConversationPickerOpen(false); });
+                if (stillOpen)
+                {
+                    await DismissConversationPickerIfOpenAsync(hwnd, false);
+                }
+                return true;
             }
 
-            string query = CleanPickerQuery(conv);
-            if (string.IsNullOrEmpty(query))
+            // Mandatory Cleanup Guarantee: NEVER leave an empty or half-open Conversations modal stuck on screen
+            await DismissConversationPickerIfOpenAsync(hwnd, didTriggerOpen);
+
+            return await Task.Run(delegate { return IsViewingTargetConversation(targetFragment); });
+        }
+
+        private static async Task<bool> PerformPickerSelectionAsync(IntPtr hwnd, ConversationSnapshot conversation, string targetPathFragment)
+        {
+            // 1. Poll up to ~840ms in 60ms steps to locate the picker search input (Edit or ComboBox) inside HubDocument
+            LocatedPicker activePicker = null;
+            for (int i = 0; i < 14; i++)
             {
-                Win32Native.SendKeyShortcut(Win32Native.VK_ESCAPE, false);
+                bool viewing = await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                if (viewing) return true;
+
+                LocatedPicker found = await Task.Run(delegate { return LocateConversationPicker(); });
+                if (found != null)
+                {
+                    activePicker = found;
+                    break;
+                }
+                await Task.Delay(60);
+            }
+
+            if (activePicker == null)
+            {
                 return false;
             }
 
-            string pickerHint = await Task.Run(delegate { return GetActivePickerHint(); });
-            if (pickerHint == null && !pickerScan.IsConvoPickerOpen)
+            AutomationElement initialScope = activePicker.Dialog ?? activePicker.HubDocument;
+
+            // 2. Pre-typing check: if target conversation link or unique row is already present in the open picker, invoke it directly
+            AutomationElement directLink = await Task.Run(delegate { return FindNonSidebarLinkInSubtree(initialScope, targetPathFragment, 18); });
+            if (directLink != null)
             {
-                return false;
-            }
-
-            Win32Native.SendKeyShortcut((ushort)Win32Native.VK_A, true);
-            await Task.Delay(25);
-
-            string fullQuery = (pickerHint != null && pickerHint.IndexOf("commands", StringComparison.OrdinalIgnoreCase) >= 0)
-                ? ("conversations: " + query)
-                : query;
-            Win32Native.SendUnicodeString(fullQuery);
-            await Task.Delay(240);
-
-            Win32Native.SendKeyShortcut(Win32Native.VK_RETURN, false);
-            for (int i = 0; i < 8; i++)
-            {
-                await Task.Delay(70);
-                bool ok = await Task.Run(delegate { return IsViewingTargetConversation(targetFragment); });
+                bool ok = await InvokeAndVerifyAsync(directLink, targetPathFragment);
                 if (ok) return true;
             }
 
-            TargetLinkScan postScan = await Task.Run(delegate { return ScanForTargetLink(targetFragment); });
-            if (postScan.IsAlreadyViewingTarget) return true;
-            if (postScan.IsConvoPickerOpen)
+            PickerScanResult initialScan = await Task.Run(delegate { return ScanPickerResults(initialScope); });
+            AutomationElement uniqueRow = UniquePreTypingMatch(initialScan.Rows, conversation);
+            if (uniqueRow != null)
             {
-                Win32Native.SendKeyShortcut(Win32Native.VK_ESCAPE, false);
+                bool rowOk = await PressPickerRowAndVerifyAsync(uniqueRow, hwnd, targetPathFragment, false);
+                if (rowOk) return true;
+
+                bool stillOpen = await Task.Run(delegate { return IsConversationPickerOpen(false); });
+                if (!stillOpen)
+                {
+                    return await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                }
             }
+
+            // 3. Build search queries and filter the picker input
+            List<string> queries = CandidatePickerQueries(conversation);
+            if (queries.Count == 0)
+            {
+                return false;
+            }
+
+            for (int qIdx = 0; qIdx < queries.Count; qIdx++)
+            {
+                string query = queries[qIdx];
+                LocatedPicker refreshed = await Task.Run(delegate { return LocateConversationPicker(); });
+                if (refreshed != null)
+                {
+                    activePicker = refreshed;
+                }
+
+                await EnterQueryIntoPickerInputAsync(activePicker.Input, query, activePicker.Placeholder, hwnd);
+
+                // Allow Base UI / React filter & full-text index to update UIA List
+                await Task.Delay(110);
+
+                bool sawNoResults = false;
+                List<PickerRowEntry> latestRows = new List<PickerRowEntry>();
+
+                for (int poll = 0; poll < 8; poll++)
+                {
+                    bool viewing = await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                    if (viewing) return true;
+
+                    LocatedPicker currentPicker = await Task.Run(delegate { return LocateConversationPicker(); }) ?? activePicker;
+                    AutomationElement scope = currentPicker.Dialog ?? currentPicker.HubDocument;
+
+                    AutomationElement hitLink = await Task.Run(delegate { return FindNonSidebarLinkInSubtree(scope, targetPathFragment, 18); });
+                    if (hitLink != null)
+                    {
+                        bool linkOk = await InvokeAndVerifyAsync(hitLink, targetPathFragment);
+                        if (linkOk) return true;
+                    }
+
+                    PickerScanResult scan = await Task.Run(delegate { return ScanPickerResults(scope); });
+                    latestRows = scan.Rows;
+
+                    AutomationElement matchedRow = BestMatchingPickerRow(scan.Rows, conversation, query);
+                    if (matchedRow != null)
+                    {
+                        bool rowOk = await PressPickerRowAndVerifyAsync(matchedRow, hwnd, targetPathFragment, true);
+                        if (rowOk) return true;
+                        return await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                    }
+
+                    if (scan.HasNoResults)
+                    {
+                        sawNoResults = true;
+                        break;
+                    }
+
+                    await Task.Delay(65);
+                }
+
+                // Fallback to Return keystroke if UIA did not expose row labels and list is non-empty
+                if (!sawNoResults && latestRows.Count == 0)
+                {
+                    bool pickerOpen = await Task.Run(delegate { return IsConversationPickerOpen(false); });
+                    if (pickerOpen)
+                    {
+                        if (Win32Native.GetForegroundWindow() != hwnd)
+                        {
+                            Win32Native.ForceActivateWindow(hwnd);
+                        }
+                        Win32Native.SendKeyShortcut(Win32Native.VK_RETURN, false);
+                        for (int k = 0; k < 8; k++)
+                        {
+                            await Task.Delay(65);
+                            bool ok = await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                            if (ok) return true;
+                        }
+                    }
+                }
+            }
+
             return false;
         }
 
-        private static string CleanPickerQuery(ConversationSnapshot conv)
+        private static async Task DismissConversationPickerIfOpenAsync(IntPtr hwnd, bool didTriggerOpen)
         {
-            string raw = !string.IsNullOrEmpty(conv.Title) ? conv.Title : (conv.SearchQuery ?? string.Empty);
-            string stripped = raw.Replace("…", string.Empty).Trim();
-            return stripped.Length > 28 ? stripped.Substring(0, 28) : stripped;
+            bool openNow = await Task.Run(delegate { return IsConversationPickerOpen(didTriggerOpen); });
+            if (!openNow)
+            {
+                if (!didTriggerOpen) return;
+                await Task.Delay(80);
+                bool openAfterSettle = await Task.Run(delegate { return IsConversationPickerOpen(true); });
+                if (!openAfterSettle) return;
+            }
+
+            for (int attempt = 0; attempt < 4; attempt++)
+            {
+                bool stillOpen = await Task.Run(delegate { return IsConversationPickerOpen(didTriggerOpen); });
+                if (!stillOpen) return;
+
+                if (Win32Native.GetForegroundWindow() != hwnd)
+                {
+                    Win32Native.ForceActivateWindow(hwnd);
+                }
+
+                int curAttempt = attempt;
+                await Task.Run(delegate
+                {
+                    LocatedPicker picker = LocateConversationPicker();
+                    if (picker != null)
+                    {
+                        if (picker.Dialog != null)
+                        {
+                            TryCloseWindowElement(picker.Dialog);
+                            if (curAttempt >= 2)
+                            {
+                                HashSet<string> closeLabels = new HashSet<string> { "Close", "Cancel", "Dismiss", "关闭", "取消" };
+                                AutomationElement cancelBtn = FindElementInSubtree(picker.Dialog, ControlType.Button, closeLabels, 8);
+                                if (cancelBtn != null)
+                                {
+                                    TryInvokeElement(cancelBtn);
+                                }
+                            }
+                        }
+                        SafeSetFocus(picker.Input);
+                    }
+                });
+
+                Win32Native.SendKeyShortcut(Win32Native.VK_ESCAPE, false);
+                await Task.Delay(110);
+            }
+        }
+
+        private static async Task EnterQueryIntoPickerInputAsync(AutomationElement input, string query, string placeholder, IntPtr hwnd)
+        {
+            string fullQuery = (!string.IsNullOrEmpty(placeholder) && placeholder.IndexOf("commands", StringComparison.OrdinalIgnoreCase) >= 0)
+                ? ("conversations: " + query)
+                : query;
+
+            // Primary method: direct ValuePattern.SetValue avoids IME composition interference
+            bool setViaPattern = await Task.Run(delegate
+            {
+                SafeSetFocus(input);
+                return TrySetElementValue(input, fullQuery);
+            });
+            if (setViaPattern)
+            {
+                await Task.Delay(55);
+                string readBack = await Task.Run(delegate { return GetElementUrl(input) ?? string.Empty; });
+                if (string.Equals(readBack, fullQuery, StringComparison.Ordinal))
+                {
+                    return;
+                }
+            }
+
+            // Fallback: focus input and type via Win32 SendInput Unicode string
+            if (Win32Native.GetForegroundWindow() != hwnd)
+            {
+                Win32Native.ForceActivateWindow(hwnd);
+            }
+            await Task.Run(delegate
+            {
+                TryInvokeElement(input);
+                SafeSetFocus(input);
+            });
+            await Task.Delay(40);
+            Win32Native.SendKeyShortcut((ushort)Win32Native.VK_A, true);
+            await Task.Delay(20);
+            Win32Native.SendUnicodeString(fullQuery);
+        }
+
+        private static async Task<bool> PressPickerRowAndVerifyAsync(AutomationElement row, IntPtr hwnd, string targetPathFragment, bool allowReturnFallback)
+        {
+            bool pressed = await Task.Run(delegate
+            {
+                TryScrollIntoView(row);
+                return TryInvokeOrSelectElement(row);
+            });
+            if (pressed)
+            {
+                for (int i = 0; i < 10; i++)
+                {
+                    await Task.Delay(65);
+                    bool viewing = await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                    if (viewing) return true;
+                }
+            }
+
+            if (allowReturnFallback)
+            {
+                bool pickerOpen = await Task.Run(delegate { return IsConversationPickerOpen(false); });
+                if (pickerOpen)
+                {
+                    if (Win32Native.GetForegroundWindow() != hwnd)
+                    {
+                        Win32Native.ForceActivateWindow(hwnd);
+                    }
+                    Win32Native.SendKeyShortcut(Win32Native.VK_RETURN, false);
+                    for (int i = 0; i < 8; i++)
+                    {
+                        await Task.Delay(65);
+                        bool viewing = await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
+                        if (viewing) return true;
+                    }
+                }
+            }
+
+            return await Task.Run(delegate { return IsViewingTargetConversation(targetPathFragment); });
         }
 
         // MARK: - Delete Conversation Inside Antigravity UI
@@ -719,13 +992,9 @@ namespace AntigravityAssistant
                     string name = SafeName(cur);
                     if (string.Equals(name, "Sidebar", StringComparison.Ordinal) || ct == ControlType.Header) continue;
 
-                    if (ct == ControlType.Edit)
+                    if (PickerInputPlaceholder(cur) != null)
                     {
-                        string hint = name + " " + SafeHelpText(cur);
-                        if (IsConvoPickerPlaceholder(hint))
-                        {
-                            res.IsConvoPickerOpen = true;
-                        }
+                        res.IsConvoPickerOpen = true;
                     }
                     else if (ct == ControlType.Hyperlink)
                     {
@@ -768,25 +1037,148 @@ namespace AntigravityAssistant
         {
             if (string.IsNullOrEmpty(text)) return false;
             return text.IndexOf("Search for conversations", StringComparison.OrdinalIgnoreCase) >= 0
-                || text.IndexOf("Search conversations", StringComparison.OrdinalIgnoreCase) >= 0;
+                || text.IndexOf("Search conversations", StringComparison.OrdinalIgnoreCase) >= 0
+                || text.IndexOf("Search commands", StringComparison.OrdinalIgnoreCase) >= 0
+                || text.IndexOf("Type a command", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        private static string GetActivePickerHint()
+        private static string PickerInputPlaceholder(AutomationElement el)
         {
-            try
+            if (el == null) return null;
+            ControlType ct = SafeControlType(el);
+            if (ct != ControlType.ComboBox && ct != ControlType.Edit)
             {
-                AutomationElement focused = AutomationElement.FocusedElement;
-                if (focused != null && SafeControlType(focused) == ControlType.Edit)
+                return null;
+            }
+
+            string[] candidates = new string[]
+            {
+                SafeName(el),
+                SafeHelpText(el),
+                SafeItemStatus(el)
+            };
+
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                string c = candidates[i];
+                if (!string.IsNullOrEmpty(c) && IsConvoPickerPlaceholder(c))
                 {
-                    string hint = (SafeName(focused) + " " + SafeHelpText(focused)).Trim();
-                    if (IsConvoPickerPlaceholder(hint) || hint.IndexOf("commands", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return c;
+                }
+            }
+            return null;
+        }
+
+        private struct PickerBfsNode
+        {
+            public AutomationElement Element;
+            public int Depth;
+            public AutomationElement EnclosingDialog;
+
+            public PickerBfsNode(AutomationElement el, int d, AutomationElement dialog)
+            {
+                Element = el;
+                Depth = d;
+                EnclosingDialog = dialog;
+            }
+        }
+
+        private static LocatedPicker LocateConversationPicker()
+        {
+            List<IntPtr> windows = FindAntigravityWindowHandles();
+            AutomationElement firstHubDoc = null;
+
+            for (int w = 0; w < windows.Count; w++)
+            {
+                AutomationElement winEl = SafeFromHandle(windows[w]);
+                if (winEl == null) continue;
+                AutomationElement doc = FindHubDocument(winEl, 0);
+                if (doc == null) continue;
+                if (firstHubDoc == null) firstHubDoc = doc;
+
+                Queue<PickerBfsNode> queue = new Queue<PickerBfsNode>();
+                queue.Enqueue(new PickerBfsNode(doc, 0, null));
+                int visited = 0;
+
+                while (queue.Count > 0 && visited < 700)
+                {
+                    PickerBfsNode item = queue.Dequeue();
+                    visited++;
+                    AutomationElement cur = item.Element;
+                    int d = item.Depth;
+
+                    ControlType ct = SafeControlType(cur);
+                    string nm = SafeName(cur);
+                    if (string.Equals(nm, "Sidebar", StringComparison.Ordinal) || ct == ControlType.MenuBar) continue;
+
+                    AutomationElement nextDialog = IsDialogElement(cur) ? cur : item.EnclosingDialog;
+                    string ph = PickerInputPlaceholder(cur);
+                    if (ph != null)
                     {
-                        return hint;
+                        LocatedPicker lp = new LocatedPicker();
+                        lp.HubDocument = doc;
+                        lp.Dialog = nextDialog;
+                        lp.Input = cur;
+                        lp.Placeholder = ph;
+                        return lp;
+                    }
+
+                    if (d < 20)
+                    {
+                        List<AutomationElement> children = GetChildrenList(cur);
+                        for (int i = 0; i < children.Count; i++)
+                        {
+                            queue.Enqueue(new PickerBfsNode(children[i], d + 1, nextDialog));
+                        }
                     }
                 }
             }
-            catch
+
+            // Secondary fallback: inspect AutomationElement.FocusedElement
+            if (firstHubDoc != null)
             {
+                try
+                {
+                    AutomationElement focused = AutomationElement.FocusedElement;
+                    string ph = PickerInputPlaceholder(focused);
+                    if (ph != null)
+                    {
+                        LocatedPicker lp = new LocatedPicker();
+                        lp.HubDocument = firstHubDoc;
+                        lp.Dialog = null;
+                        lp.Input = focused;
+                        lp.Placeholder = ph;
+                        return lp;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        private static bool IsDialogElement(AutomationElement el)
+        {
+            if (el == null) return false;
+            ControlType ct = SafeControlType(el);
+            if (ct == ControlType.Window) return true;
+            string locType = SafeLocalizedControlType(el);
+            if (string.Equals(locType, "dialog", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(locType, "alert dialog", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            string itemType = SafeItemType(el);
+            return string.Equals(itemType, "dialog", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsConversationPickerOpen(bool includeGenericDialog)
+        {
+            if (LocateConversationPicker() != null)
+            {
+                return true;
             }
 
             List<IntPtr> windows = FindAntigravityWindowHandles();
@@ -800,26 +1192,363 @@ namespace AntigravityAssistant
                 Queue<KeyValuePair<AutomationElement, int>> queue = new Queue<KeyValuePair<AutomationElement, int>>();
                 queue.Enqueue(new KeyValuePair<AutomationElement, int>(doc, 0));
                 int visited = 0;
-                while (queue.Count > 0 && visited < 500)
+
+                while (queue.Count > 0 && visited < 400)
                 {
                     KeyValuePair<AutomationElement, int> item = queue.Dequeue();
                     visited++;
                     AutomationElement cur = item.Key;
                     int d = item.Value;
+                    ControlType ct = SafeControlType(cur);
                     string nm = SafeName(cur);
-                    if (string.Equals(nm, "Sidebar", StringComparison.Ordinal)) continue;
-                    if (SafeControlType(cur) == ControlType.Edit)
+                    if (string.Equals(nm, "Sidebar", StringComparison.Ordinal) || ct == ControlType.MenuBar) continue;
+
+                    if (IsDialogElement(cur))
                     {
-                        string hint = (nm + " " + SafeHelpText(cur)).Trim();
-                        if (IsConvoPickerPlaceholder(hint) || hint.IndexOf("commands", StringComparison.OrdinalIgnoreCase) >= 0)
+                        if (includeGenericDialog)
                         {
-                            return hint;
+                            if (FindModalDeleteConfirmButton(cur) == null)
+                            {
+                                return true;
+                            }
+                        }
+                        else if (DialogLooksLikeConversationPicker(cur))
+                        {
+                            return true;
                         }
                     }
+
                     if (d < 14) EnqueueChildren(cur, d + 1, queue);
                 }
             }
+            return false;
+        }
+
+        private static bool DialogLooksLikeConversationPicker(AutomationElement dialog)
+        {
+            Queue<KeyValuePair<AutomationElement, int>> queue = new Queue<KeyValuePair<AutomationElement, int>>();
+            queue.Enqueue(new KeyValuePair<AutomationElement, int>(dialog, 0));
+            int visited = 0;
+
+            while (queue.Count > 0 && visited < 120)
+            {
+                KeyValuePair<AutomationElement, int> item = queue.Dequeue();
+                visited++;
+                AutomationElement cur = item.Key;
+                int d = item.Value;
+
+                if (PickerInputPlaceholder(cur) != null) return true;
+                ControlType ct = SafeControlType(cur);
+                string nm = SafeName(cur);
+                string val = GetElementUrl(cur) ?? string.Empty;
+                if (nm.IndexOf("Sort and filter conversations", StringComparison.OrdinalIgnoreCase) >= 0
+                    || (ct == ControlType.ComboBox && string.Equals(val, "Conversations", StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+
+                if (d < 8) EnqueueChildren(cur, d + 1, queue);
+            }
+            return false;
+        }
+
+        private static AutomationElement FindNonSidebarLinkInSubtree(AutomationElement el, string targetFragment, int maxDepth)
+        {
+            if (maxDepth < 0 || el == null) return null;
+            if (string.Equals(SafeName(el), "Sidebar", StringComparison.Ordinal)) return null;
+
+            if (SafeControlType(el) == ControlType.Hyperlink)
+            {
+                string u = GetElementUrl(el) ?? string.Empty;
+                if (u.IndexOf(targetFragment, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return el;
+                }
+            }
+
+            List<AutomationElement> children = GetChildrenList(el);
+            for (int i = 0; i < children.Count; i++)
+            {
+                AutomationElement hit = FindNonSidebarLinkInSubtree(children[i], targetFragment, maxDepth - 1);
+                if (hit != null) return hit;
+            }
             return null;
+        }
+
+        private static PickerScanResult ScanPickerResults(AutomationElement scope)
+        {
+            PickerScanResult res = new PickerScanResult();
+            if (scope == null) return res;
+
+            List<AutomationElement> targetLists = new List<AutomationElement>();
+            CollectPickerLists(scope, 0, targetLists);
+
+            for (int i = 0; i < targetLists.Count; i++)
+            {
+                WalkPickerList(targetLists[i], 0, res);
+            }
+            return res;
+        }
+
+        private static void CollectPickerLists(AutomationElement el, int depth, List<AutomationElement> targetLists)
+        {
+            if (depth > 14 || el == null) return;
+            string nm = SafeName(el);
+            if (string.Equals(nm, "Sidebar", StringComparison.Ordinal)
+                || string.Equals(nm, "Breadcrumb", StringComparison.Ordinal)
+                || string.Equals(nm, "Typeahead menu", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            ControlType ct = SafeControlType(el);
+            if (ct == ControlType.List)
+            {
+                targetLists.Add(el);
+                return;
+            }
+
+            List<AutomationElement> children = GetChildrenList(el);
+            for (int i = 0; i < children.Count; i++)
+            {
+                CollectPickerLists(children[i], depth + 1, targetLists);
+            }
+        }
+
+        private static void WalkPickerList(AutomationElement el, int depth, PickerScanResult res)
+        {
+            if (depth > 8 || el == null) return;
+            ControlType ct = SafeControlType(el);
+            string nm = SafeName(el).Trim();
+
+            if (ct == ControlType.Text && nm.IndexOf("No results found", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                res.HasNoResults = true;
+                return;
+            }
+
+            if (depth > 0 && ct != ControlType.List && SupportsPickerRowAction(el, ct))
+            {
+                List<string> childSegments = new List<string>();
+                CollectStaticTextSegments(el, 0, 4, childSegments);
+                string val = (GetElementUrl(el) ?? string.Empty).Trim();
+                string combined = !string.IsNullOrEmpty(val)
+                    ? val
+                    : (!string.IsNullOrEmpty(nm) ? nm : string.Join(" ", childSegments)).Trim();
+
+                string lower = combined.ToLowerInvariant();
+                bool isShowMore = lower.StartsWith("show ", StringComparison.Ordinal) && lower.Contains("more");
+                if (!isShowMore && !string.IsNullOrEmpty(combined))
+                {
+                    PickerRowEntry entry = new PickerRowEntry();
+                    entry.Element = el;
+                    entry.Text = combined;
+                    entry.ChildTexts = childSegments;
+                    res.Rows.Add(entry);
+                }
+                return;
+            }
+
+            List<AutomationElement> children = GetChildrenList(el);
+            for (int i = 0; i < children.Count; i++)
+            {
+                WalkPickerList(children[i], depth + 1, res);
+            }
+        }
+
+        private static void CollectStaticTextSegments(AutomationElement node, int depth, int maxDepth, List<string> segments)
+        {
+            if (depth > maxDepth || node == null) return;
+            if (depth > 0 && SafeControlType(node) == ControlType.Text)
+            {
+                string v = SafeName(node).Trim();
+                if (!string.IsNullOrEmpty(v))
+                {
+                    segments.Add(v);
+                    return;
+                }
+            }
+            List<AutomationElement> children = GetChildrenList(node);
+            for (int i = 0; i < children.Count; i++)
+            {
+                CollectStaticTextSegments(children[i], depth + 1, maxDepth, segments);
+            }
+        }
+
+        private static string NormalizePickerText(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return string.Empty;
+            string[] parts = raw.Replace("…", string.Empty)
+                .Split(new char[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            return string.Join(" ", parts).ToLowerInvariant();
+        }
+
+        private static string CleanedTitleForMatching(ConversationSnapshot conv)
+        {
+            if (conv == null || string.IsNullOrEmpty(conv.Title)) return string.Empty;
+            string prefix8 = conv.Id != null && conv.Id.Length >= 8 ? conv.Id.Substring(0, 8) : (conv.Id ?? string.Empty);
+            if (string.Equals(conv.Title, "会话 " + prefix8, StringComparison.Ordinal))
+            {
+                return string.Empty;
+            }
+            return NormalizePickerText(conv.Title);
+        }
+
+        private static AutomationElement UniquePreTypingMatch(List<PickerRowEntry> rows, ConversationSnapshot conv)
+        {
+            string titleNorm = CleanedTitleForMatching(conv);
+            if (string.IsNullOrEmpty(titleNorm)) return null;
+            string projNorm = string.Equals(conv.ProjectName, "default", StringComparison.OrdinalIgnoreCase)
+                ? string.Empty
+                : (conv.ProjectName ?? string.Empty).Trim().ToLowerInvariant();
+
+            List<AutomationElement> strongMatches = new List<AutomationElement>();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                PickerRowEntry row = rows[i];
+                string rowNorm = NormalizePickerText(row.Text);
+                string firstChildNorm = row.ChildTexts.Count > 0 ? NormalizePickerText(row.ChildTexts[0]) : string.Empty;
+                bool titleMatches = string.Equals(firstChildNorm, titleNorm, StringComparison.Ordinal)
+                    || string.Equals(rowNorm, titleNorm, StringComparison.Ordinal)
+                    || rowNorm.StartsWith(titleNorm + " ", StringComparison.Ordinal);
+
+                if (!titleMatches) continue;
+
+                if (!string.IsNullOrEmpty(projNorm))
+                {
+                    bool hasProj = ContainsIgnoreCase(row.ChildTexts, projNorm)
+                        || rowNorm.Contains(" " + projNorm + " ")
+                        || rowNorm.EndsWith(" " + projNorm, StringComparison.Ordinal);
+                    if (hasProj)
+                    {
+                        strongMatches.Add(row.Element);
+                    }
+                }
+                else
+                {
+                    strongMatches.Add(row.Element);
+                }
+            }
+
+            return strongMatches.Count == 1 ? strongMatches[0] : null;
+        }
+
+        private static AutomationElement BestMatchingPickerRow(List<PickerRowEntry> rows, ConversationSnapshot conv, string typedQuery)
+        {
+            if (rows == null || rows.Count == 0) return null;
+            string titleNorm = CleanedTitleForMatching(conv);
+            string searchNorm = NormalizePickerText(conv.SearchQuery);
+            string queryNorm = NormalizePickerText(typedQuery);
+            string projNorm = string.Equals(conv.ProjectName, "default", StringComparison.OrdinalIgnoreCase)
+                ? string.Empty
+                : (conv.ProjectName ?? string.Empty).Trim().ToLowerInvariant();
+
+            AutomationElement bestElement = null;
+            int bestScore = 0;
+
+            for (int idx = 0; idx < rows.Count; idx++)
+            {
+                PickerRowEntry row = rows[idx];
+                string rowNorm = NormalizePickerText(row.Text);
+                int score = 0;
+
+                if (!string.IsNullOrEmpty(titleNorm))
+                {
+                    if (string.Equals(rowNorm, titleNorm, StringComparison.Ordinal) || rowNorm.StartsWith(titleNorm + " ", StringComparison.Ordinal))
+                    {
+                        score += 300;
+                    }
+                    else if (rowNorm.StartsWith(titleNorm, StringComparison.Ordinal) || rowNorm.Contains(titleNorm))
+                    {
+                        score += 220;
+                    }
+                    else if (titleNorm.Length >= 12 && rowNorm.Contains(titleNorm.Substring(0, Math.Min(16, titleNorm.Length))))
+                    {
+                        score += 150;
+                    }
+                }
+
+                if (score == 0 && searchNorm.Length >= 4 && rowNorm.Contains(searchNorm))
+                {
+                    score += 130;
+                }
+
+                if (score == 0 && queryNorm.Length >= 3 && rowNorm.Contains(queryNorm))
+                {
+                    score += 110;
+                }
+
+                if (score <= 0) continue;
+
+                if (!string.IsNullOrEmpty(projNorm))
+                {
+                    bool hasProj = ContainsIgnoreCase(row.ChildTexts, projNorm)
+                        || rowNorm.Contains(" " + projNorm + " ")
+                        || rowNorm.Contains(projNorm);
+                    if (hasProj)
+                    {
+                        score += 90;
+                    }
+                }
+
+                score += Math.Max(0, 15 - idx);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestElement = row.Element;
+                }
+            }
+
+            return bestElement;
+        }
+
+        private static bool ContainsIgnoreCase(List<string> list, string target)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i], target, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static List<string> CandidatePickerQueries(ConversationSnapshot conv)
+        {
+            List<string> queries = new List<string>();
+            if (conv == null) return queries;
+            string prefix8 = conv.Id != null && conv.Id.Length >= 8 ? conv.Id.Substring(0, 8) : (conv.Id ?? string.Empty);
+            string fallbackTitle = "会话 " + prefix8;
+
+            if (!string.IsNullOrEmpty(conv.Title) && !string.Equals(conv.Title, fallbackTitle, StringComparison.Ordinal))
+            {
+                string q1 = CleanQuerySegment(conv.Title);
+                if (!string.IsNullOrEmpty(q1))
+                {
+                    queries.Add(q1);
+                }
+            }
+
+            if (!string.IsNullOrEmpty(conv.SearchQuery))
+            {
+                string q2 = CleanQuerySegment(conv.SearchQuery);
+                if (!string.IsNullOrEmpty(q2) && !ContainsIgnoreCase(queries, q2))
+                {
+                    queries.Add(q2);
+                }
+            }
+
+            return queries;
+        }
+
+        private static string CleanQuerySegment(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return string.Empty;
+            string[] parts = raw.Replace("…", string.Empty)
+                .Split(new char[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            string joined = string.Join(" ", parts);
+            return joined.Length > 34 ? joined.Substring(0, 34) : joined;
         }
 
         private static bool PressButtonInHub(string matchingDescription)
@@ -850,7 +1579,7 @@ namespace AntigravityAssistant
 
         private static void WalkSidebarButtons(AutomationElement el, int depth, List<KeyValuePair<AutomationElement, string>> results)
         {
-            if (depth > 12 || el == null) return;
+            if (depth > 24 || el == null) return;
             if (SafeControlType(el) == ControlType.Button)
             {
                 string title = SafeName(el).Trim();
@@ -948,6 +1677,106 @@ namespace AntigravityAssistant
         {
             try { return el.Current.HelpText ?? string.Empty; }
             catch { return string.Empty; }
+        }
+
+        private static string SafeItemStatus(AutomationElement el)
+        {
+            try { return el.Current.ItemStatus ?? string.Empty; }
+            catch { return string.Empty; }
+        }
+
+        private static string SafeItemType(AutomationElement el)
+        {
+            try { return el.Current.ItemType ?? string.Empty; }
+            catch { return string.Empty; }
+        }
+
+        private static string SafeLocalizedControlType(AutomationElement el)
+        {
+            try { return el.Current.LocalizedControlType ?? string.Empty; }
+            catch { return string.Empty; }
+        }
+
+        private static void SafeSetFocus(AutomationElement el)
+        {
+            if (el == null) return;
+            try { el.SetFocus(); } catch { }
+        }
+
+        private static bool TrySetElementValue(AutomationElement el, string value)
+        {
+            if (el == null) return false;
+            try
+            {
+                object vpObj;
+                if (el.TryGetCurrentPattern(ValuePattern.Pattern, out vpObj))
+                {
+                    ValuePattern vp = vpObj as ValuePattern;
+                    if (vp != null && !vp.Current.IsReadOnly)
+                    {
+                        vp.SetValue(value);
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        private static void TryCloseWindowElement(AutomationElement el)
+        {
+            if (el == null) return;
+            try
+            {
+                object pat;
+                if (el.TryGetCurrentPattern(WindowPattern.Pattern, out pat))
+                {
+                    ((WindowPattern)pat).Close();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static bool SupportsPickerRowAction(AutomationElement el, ControlType ct)
+        {
+            if (el == null) return false;
+            if (ct == ControlType.ListItem || ct == ControlType.Button || ct == ControlType.Hyperlink)
+            {
+                return true;
+            }
+            try
+            {
+                object pat;
+                if (el.TryGetCurrentPattern(InvokePattern.Pattern, out pat)) return true;
+                if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pat)) return true;
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        private static bool TryInvokeOrSelectElement(AutomationElement el)
+        {
+            if (TryInvokeElement(el)) return true;
+            if (el == null) return false;
+            try
+            {
+                object pat;
+                if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pat))
+                {
+                    ((SelectionItemPattern)pat).Select();
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+            return false;
         }
 
         private static string GetElementUrl(AutomationElement el)
